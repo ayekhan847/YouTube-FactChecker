@@ -1,27 +1,22 @@
 from flask import Flask, render_template, request
-from api_helpers import fetch_captions, extract_claims, verify_claims, calculate_credibility, deduplicate_claims
+from api_helpers import process_transcript
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    video_id = request.args.get('v', '')
-    captions = claims = credibility = None
+    video_id = request.args.get('video_id', '')
+    results = {"claims": [], "error": None}
 
     if video_id:
-        # Fetch captions
-        captions = fetch_captions(video_id)
-        if isinstance(captions, str):  # If captions is an error message
-            return render_template('index.html', video_id=video_id, captions=captions, claims=claims, credibility=credibility)
+        results = process_transcript(video_id)
 
-        # Extract claims and deduplicate
-        raw_claims = extract_claims(captions)
-        claims = deduplicate_claims(raw_claims)
-
-        # Calculate credibility
-        credibility = calculate_credibility(claims)
-
-    return render_template('index.html', video_id=video_id, captions=captions, claims=claims, credibility=credibility)
+    return render_template(
+        'index.html',
+        video_id=video_id,
+        claims=results.get("claims", []),
+        error=results.get("error")
+    )
 
 if __name__ == "__main__":
     app.run(debug=True)

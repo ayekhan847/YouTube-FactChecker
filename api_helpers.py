@@ -1,107 +1,71 @@
-from googleapiclient.discovery import build
-from youtube_transcript_api import YouTubeTranscriptApi
-from google.cloud import language_v1
 import os
-# API Keys and Credentials
-YOUTUBE_API_KEY = os.getenv("YT_DATA_API")
-FACT_CHECK_API_KEY = os.getenv("YT_DATA_API")
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
+from google.cloud import language_v1
+
+#initializing the Google Cloud Language API client
 language_client = language_v1.LanguageServiceClient()
 
-# Fetch captions for a YouTube video
-def fetch_captions(video_id):
+
+def fetch_transcript(video_id):
     try:
+        #getting the transcript from YouTube Video
         transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        # Combine captions into chunks of 5 sentences for more context
-        combined_text = []
-        chunk = []
-        for i, item in enumerate(transcript):
-            chunk.append(item['text'])
-            if (i + 1) % 5 == 0:  # Every 5 sentences, combine into one block
-                combined_text.append({"text": " ".join(chunk), "start": item["start"]})
-                chunk = []
-        # Add any remaining chunk
-        if chunk:
-            combined_text.append({"text": " ".join(chunk), "start": transcript[-1]["start"]})
-        return combined_text
+        return transcript  # Returns a list of {text, start, duration}
+    except TranscriptsDisabled:
+        return {"error": "Transcripts are disabled for this video."}
+    except NoTranscriptFound:
+        return {"error": "No transcript was found for this video."}
     except Exception as e:
-        return [{"text": f"Error fetching captions: {e}", "start": 0}]
+        return {"error": str(e)}
 
 
-# Extract factual claims using Google Natural Language API
-def extract_claims(transcript, chunk_size=3):
-    all_claims = []
-    chunk = []
+def analyze_transcript(transcript, salience_threshold=0.15):
+    claims = []
 
-    for idx, item in enumerate(transcript):
-        chunk.append(item["text"])
+    for segment in transcript:
+        text = segment["text"]
+        timestamp = segment["start"]
 
-        # Group captions into chunks of specified size
-        if (idx + 1) % chunk_size == 0 or idx == len(transcript) - 1:
-            combined_text = " ".join(chunk)
-            chunk = []  # Reset for the next chunk
+        #prepare the document for Google Cloud NLP
+        document = language_v1.Document(content=text, type_=language_v1.Document.Type.PLAIN_TEXT)
 
-            # Analyze the combined chunk
-            document = language_v1.Document(content=combined_text, type_=language_v1.Document.Type.PLAIN_TEXT)
+        try:
+            # Using the google natural language to analyze the entities
             response = language_client.analyze_entities(document=document)
 
-            # Process entities
-            for entity in response.entities:
-                if entity.salience > 0.1:  # Filter by relevance
-                    verified_results = verify_claims(entity.name)
+            # filtering each entity with the name, type, and salience
+            relevant_entities = [
+                {
+                    "entity_name": entity.name,
+                    "entity_type": language_v1.Entity.Type(entity.type_).name,
+                    "salience": entity.salience
+                }
+                for entity in response.entities
+                if entity.salience >= salience_threshold and entity.type_ != language_v1.Entity.Type.NUMBER
+            ]
 
-                    for result in verified_results:
-                        if result.get("language", "en") == "en":  # Only  English results
-                            all_claims.append({
-                                "claim": f"Excerpt: {entity.name}",  # Focus only on the claim
-                                "full_context": combined_text,  #provide the larger context
-                                "timestamp": item["start"],  # Use the last item's timestamp
-                                "verification": result.get("review", "Unverified"),
-                                "source": result.get("source", "#")
-                            })
+            #going to append the claim only if important entities are found
+            if relevant_entities:
+                claims.append({
+                    "claim_text": text,
+                    "timestamp": timestamp,
+                    "entities": relevant_entities
+                })
 
-    return all_claims
+        except Exception as e:
+            claims.append({"error": f"Entity analysis failed: {str(e)}"})
 
-def deduplicate_claims(claims):
-    unique_claims = {}
-    for claim in claims:
-        key = claim["claim"]
-        if key not in unique_claims:
-            unique_claims[key] = claim
-    return list(unique_claims.values())
+    return claims
 
 
-# Verify claims using Fact Check API
-def verify_claims(claim):
-    fact_check_service = build("factchecktools", "v1alpha1", developerKey=FACT_CHECK_API_KEY)
-    request = fact_check_service.claims().search(query=claim)
-    response = request.execute()
+def process_transcript(video_id):
+    #first save transcript by fetching it
+    transcript = fetch_transcript(video_id)
 
-    # Filter fact-checking results to include only English responses
-    verification_results = []
-    for result in response.get("claims", []):
-        language = result.get("textLanguage", "en")
-        if language == "en":
-            verification_results.append({
-                "claim": result.get("text", "No text available"),
-                "claimant": result.get("claimant", "Unknown"),
-                "review": result.get("claimReview", [{}])[0].get("textualRating", "Unverified"),
-                "source": result.get("claimReview", [{}])[0].get("url", "#")
-            })
-    return verification_results
+    # For errors
+    if isinstance(transcript, dict) and "error" in transcript:
+        return transcript
 
-def calculate_credibility(claims):
-    verified = len([c for c in claims if c.get("verification") == "Verified"])
-    disputed = len([c for c in claims if c.get("verification") == "Disputed"])
-    total = len(claims)
-
-    if total == 0:
-        return "No Claims"
-
-    score = (verified - disputed) / total
-    if score > 0.7:
-        return "Mostly Accurate"
-    elif score > 0.3:
-        return "Mixed Claims"
-    else:
-        return "Mostly Disputed"
-
+    #analyze the transcript
+    claims = analyze_transcript(transcript)
+    return {"claims": claims}
